@@ -1,0 +1,93 @@
+diff --git a/server/scripts/seeds.ts b/server/scripts/seeds.ts
+index db571b214..11bb7924e 100644
+--- a/server/scripts/seeds.ts
++++ b/server/scripts/seeds.ts
+@@ -1,4 +1,7 @@
+-import { DataSource } from 'typeorm';
++import { DataSource, EntityManager } from 'typeorm';
++import { DataSource as TooljetDataSource } from '../src/entities/data_source.entity';
++import { DataSourceOptions } from '../src/entities/data_source_options.entity';
++import { DefaultDataSourceKinds, DataSourceScopes, DataSourceTypes } from '../src/modules/data-sources/constants';
+ import { ormconfig } from '../ormconfig';
+ import { User } from '../src/entities/user.entity';
+ import { Organization } from '../src/entities/organization.entity';
+@@ -11,6 +14,7 @@ import { Metadata } from '../src/entities/metadata.entity';
+ import { defaultAppEnvironments } from '../src/helpers/utils.helper';
+ import { OnboardingStatus } from '../src/modules/onboarding/constants';
+ import { DEFAULT_GROUP_PERMISSIONS } from '../src/modules/group-permissions/constants';
++import { getEnvVars } from './database-config-utils';
+ 
+ const SEED_DEFAULTS = {
+   email: 'dev@tooljet.io',
+@@ -30,6 +34,34 @@ function getSeedConfig() {
+   };
+ }
+ 
++// Seeded workspaces need the same built-in sources as the normal onboarding flow.
++// This also repairs older seeds without replacing existing sources or options.
++async function ensureDefaultDataSources(manager: EntityManager, organizationId: string) {
++  const environments = await manager.find(AppEnvironment, { where: { organizationId } });
++  for (const kind of DefaultDataSourceKinds) {
++    let source = await manager.findOne(TooljetDataSource, {
++      where: { organizationId, kind, type: DataSourceTypes.STATIC },
++    });
++    if (!source) {
++      source = await manager.save(
++        manager.create(TooljetDataSource, {
++          name: kind + 'default',
++          kind,
++          organizationId,
++          type: DataSourceTypes.STATIC,
++          scope: DataSourceScopes.GLOBAL,
++        })
++      );
++    }
++    for (const environment of environments) {
++      const where = { dataSourceId: source.id, environmentId: environment.id };
++      if (!(await manager.findOne(DataSourceOptions, { where }))) {
++        await manager.save(manager.create(DataSourceOptions, where));
++      }
++    }
++  }
++}
++
+ async function bootstrap() {
+   const config = getSeedConfig();
+ 
+@@ -46,17 +78,26 @@ async function bootstrap() {
+   // Check if already seeded
+   const existingUser = await manager.findOne(User, { where: { email: config.email } });
+   if (existingUser) {
+-    console.log('Database already seeded. Skipping.');
++    await manager.transaction((txManager) => ensureDefaultDataSources(txManager, existingUser.defaultOrganizationId));
++    console.log('Database already seeded. Ensured built-in data sources.');
+     await dataSource.destroy();
+     process.exit(0);
+   }
+ 
++  // 工作区级注册开关必须与实例级 ENABLE_SIGNUP 保持一致。
++  // 实例级默认值见 src/modules/instance-settings/constants -> getDefaultInstanceSettings()，读的是 DISABLE_SIGNUPS。
++  // 两者错位时（实例级允许注册、工作区级禁止注册），登录页会出现「创建账户」入口，
++  // 但 POST /api/onboarding/signup 会被 CE 守卫以 403 拒绝（src/modules/onboarding/service.ts）。
++  // 注意：DISABLE_SIGNUPS 由 .env 载入，必须走 getEnvVars()，process.env 里取不到。
++  const enableSignUp = getEnvVars().DISABLE_SIGNUPS === 'false';
++
+   await manager.transaction(async (txManager) => {
+     // 1. Create organization with SSO config
+     const organization = txManager.create(Organization, {
+       name: config.workspaceName,
+       slug: config.workspaceName.toLowerCase().replace(/\s+/g, '-'),
+       isDefault: true,
++      enableSignUp,
+       ssoConfigs: [
+         {
+           enabled: true,
+@@ -102,6 +143,8 @@ async function bootstrap() {
+       await txManager.save(appEnv);
+     }
+ 
++    await ensureDefaultDataSources(txManager, organization.id);
++
+     // 5. Create default permission groups (admin, builder, end_user)
+     for (const groupKey of Object.keys(DEFAULT_GROUP_PERMISSIONS)) {
+       const groupDef = DEFAULT_GROUP_PERMISSIONS[groupKey];

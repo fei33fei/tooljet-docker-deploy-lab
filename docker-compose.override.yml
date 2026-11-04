@@ -1,0 +1,91 @@
+# ToolJet 开发环境覆盖配置
+# 参照 blinko 部署的约定：命名项目、restart 策略、日志轮转、健康检查
+# 与上游 docker-compose.yaml 自动合并（docker compose 会自动加载 override 文件）
+name: tooljet
+
+services:
+  # server 镜像改用本地变体：跳过从 AWS S3 下载 Oracle instantclient 的那一层
+  # （本机实测速率约 44KB/s，会让构建长时间挂起；详见 docker/server.Dockerfile.dev.local 顶部注释）
+  server:
+    build:
+      context: .
+      dockerfile: docker/server.Dockerfile.dev.local
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "5"
+
+  postgres:
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U tooljet -d postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  redis:
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # postgrest 官方镜像里没有 shell（连 sh 都没有），healthcheck 无法执行 → 恒为 unhealthy。
+  # 它本身启动正常（日志显示已连上 PostgreSQL 并加载配置），故不设 healthcheck。
+  postgrest:
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # plugins 镜像改用本地变体：跳过依赖的 install 脚本
+  # （oracledb / ibm_db / hana-client 会在安装时从厂商站点下大包，实测卡死构建；
+  #   plugins 运行时只是 tsc -b --watch，纯 TS 编译，不需要这些原生二进制）
+  plugins:
+    build:
+      context: ./
+      dockerfile: ./docker/plugins.Dockerfile.dev.local
+    # 上游只跑 `tsc -b --watch`，但 @tooljet/plugins/client（前端要）和
+    # @tooljet/plugins/dist/server（后端要）都是构建产物：
+    #   client.js  ← create:client
+    #   server.ts  ← create:server
+    #   dist/*.js  ← tsc -b
+    # 所以必须先跑完整 build（create:client → create:server → build:packages →
+    # build:server → create:operations），产物落在 bind mount 的 ./plugins 里，
+    # server / client 两个容器通过同一挂载共享。
+    command: sh -c "cd /app/plugins && npm run build && npm run start"
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "5"
+
+  # client 镜像改用本地变体：npm 走国内镜像源
+  # （直连 registry.npmjs.org 拉 2000+ 依赖会 ETIMEDOUT；实测 npmmirror 快 5.2 倍）
+  client:
+    build:
+      context: ./
+      dockerfile: ./docker/client.Dockerfile.dev.local
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "5"

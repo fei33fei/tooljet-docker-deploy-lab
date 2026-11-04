@@ -1,0 +1,73 @@
+# ToolJet client 镜像 —— 本地开发变体（npm 走国内镜像源 + xlsx 换源）
+#
+# 与上游 docker/client.Dockerfile.dev 的差异：
+#
+# 1) npm 安装改用国内镜像源
+#    直连 registry.npmjs.org 拉前端 2000+ 依赖时出现过
+#    `npm error network read ETIMEDOUT`（636 秒后失败）。
+#    实测同样 10 个 tarball：
+#      registry.npmmirror.com  →   8.5 秒
+#      registry.npmjs.org      →  44.4 秒   （慢 5.2 倍且会超时）
+#    npm 默认的 replace-registry-host=npmjs 会把 lockfile 里
+#    registry.npmjs.org 的 resolved 地址重写为配置的 registry，因此 lockfile 无需改动。
+#
+# 2) xlsx 从 cdn.sheetjs.com 换成 npm registry 上的 0.18.5
+#    frontend/package.json 里 xlsx 是一个直链 URL 依赖：
+#      "xlsx": "https://cdn.sheetjs.com/xlsx-0.20.3/xlsx-0.20.3.tgz"
+#    cdn.sheetjs.com 在本机**完全不可达**（IPv4 / IPv6 均超时；宿主只有 link-local IPv6），
+#    且 0.20.3 只在该 CDN 上发布，npmmirror / unpkg / jsDelivr 最高只到 0.18.5，
+#    npm 会卡在这个包上反复重试直到 ETIMEDOUT。
+#    处理方式：在镜像内（而不是仓库里）把 package.json / package-lock.json 里的
+#    xlsx 改成 registry 版 0.18.5，并删掉 lockfile 中的旧条目让 npm 重新解析。
+#    **仓库里的 tracked 文件不受影响。**
+#    兼容性已核对：前端只用到 XLSX.read / XLSX.write / XLSX.utils，
+#    这三个在 0.18.5 中均存在且行为一致。
+#
+# 3) 跳过 @sentry/cli 的二进制下载
+#    @sentry/cli@2.39.1 的 install 脚本会从 sentry CDN 下载 sentry-cli 二进制，
+#    本机该下载会长期挂死（进程 0 CPU、0 ESTAB 连接）。
+#    而这个二进制在本地开发**根本用不到**：
+#    webpack.config.js:73 只在 `process.env.APM_VENDOR === 'sentry'` 时才启用
+#    sentryWebpackPlugin，本地 .env 里 APM_VENDOR 为空。
+#    已验证：设置 SENTRYCLI_SKIP_DOWNLOAD=1 后安装顺利完成，
+#    且 require('@sentry/webpack-plugin') 仍可正常加载。
+#
+# 本文件未被 git 跟踪（已写入 .git/info/exclude），上游 tracked 文件保持原样。
+
+FROM node:22.23.4-bookworm
+
+ENV NODE_ENV=development
+ENV SENTRYCLI_SKIP_DOWNLOAD=1
+
+RUN npm i -g npm@10.9.9
+
+# set working directory
+WORKDIR /app
+
+COPY ./package.json ./package.json
+
+# add `/app/frontend/node_modules/.bin` to $PATH
+ENV PATH /app/frontend/node_modules/.bin:$PATH
+
+# Fix for heap limit allocation issue
+ENV NODE_OPTIONS="--max-old-space-size=4096"
+
+# install app dependencies
+COPY ./frontend/package.json ./frontend/package-lock.json ./frontend/
+
+# --- xlsx 换源：cdn.sheetjs.com 在本机不可达，改用 registry 上的 0.18.5 ---
+RUN node -e "const fs=require('fs');const p='./frontend/package.json';const j=JSON.parse(fs.readFileSync(p,'utf8'));j.dependencies.xlsx='0.18.5';fs.writeFileSync(p,JSON.stringify(j,null,2));const l='./frontend/package-lock.json';const k=JSON.parse(fs.readFileSync(l,'utf8'));if(k.packages&&k.packages['']&&k.packages[''].dependencies){k.packages[''].dependencies.xlsx='0.18.5';}if(k.packages)delete k.packages['node_modules/xlsx'];if(k.dependencies)delete k.dependencies.xlsx;fs.writeFileSync(l,JSON.stringify(k,null,2));" && node -e "console.log('xlsx ->', require('./frontend/package.json').dependencies.xlsx)"
+
+RUN npm --prefix frontend install \
+      --registry=https://registry.npmmirror.com \
+      --replace-registry-host=npmjs \
+      --no-audit --no-fund \
+      --fetch-retries=5 \
+      --fetch-retry-mintimeout=20000 \
+      --fetch-retry-maxtimeout=120000
+COPY ./frontend/ ./frontend/
+
+# start app
+CMD ["npm", "--prefix", "frontend", "start"]
+
+EXPOSE 8082

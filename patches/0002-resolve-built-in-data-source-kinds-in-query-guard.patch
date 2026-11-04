@@ -1,0 +1,100 @@
+diff --git a/server/src/modules/data-queries/guards/validate-query-source.guard.ts b/server/src/modules/data-queries/guards/validate-query-source.guard.ts
+index a482b0604..b1f7a0cbe 100644
+--- a/server/src/modules/data-queries/guards/validate-query-source.guard.ts
++++ b/server/src/modules/data-queries/guards/validate-query-source.guard.ts
+@@ -8,6 +8,8 @@ import {
+ } from '@nestjs/common';
+ import { User } from '@entities/user.entity';
+ import { DataSourcesRepository } from '@modules/data-sources/repository';
++import { DefaultDataSourceKinds } from '@modules/data-sources/constants';
++import { DefaultDataSourceKind } from '@modules/data-sources/types';
+ import { DataSource } from '@entities/data_source.entity';
+ import { TransactionLogger } from '@modules/logging/service';
+ 
+@@ -39,6 +41,12 @@ export class ValidateQuerySourceGuard implements CanActivate {
+ 
+       if (id) {
+         dataSource = await this.dataSourceRepository.findByQuery(id, user.organizationId, dataSourceId);
++      } else if (DefaultDataSourceKinds.includes(dataSourceId as DefaultDataSourceKind)) {
++        // Built-in sources use a kind in the route, not a database UUID.
++        dataSource = await this.dataSourceRepository.getStaticDataSourceByKind(
++          user.organizationId,
++          dataSourceId as DefaultDataSourceKind
++        );
+       } else {
+         dataSource = await this.dataSourceRepository.findById(dataSourceId, user.organizationId);
+       }
+diff --git a/server/test/modules/data-queries/unit/validate-query-source.guard.spec.ts b/server/test/modules/data-queries/unit/validate-query-source.guard.spec.ts
+new file mode 100644
+index 000000000..223052d45
+--- /dev/null
++++ b/server/test/modules/data-queries/unit/validate-query-source.guard.spec.ts
+@@ -0,0 +1,68 @@
++import { ExecutionContext, ForbiddenException, NotFoundException } from '@nestjs/common';
++import { ValidateQuerySourceGuard } from '../../../../src/modules/data-queries/guards/validate-query-source.guard';
++
++jest.mock('@modules/data-sources/repository', () => ({ DataSourcesRepository: class {} }));
++jest.mock('@modules/logging/service', () => ({ TransactionLogger: class {} }));
++
++describe('ValidateQuerySourceGuard built-in data sources', () => {
++  let repository: any;
++  let guard: ValidateQuerySourceGuard;
++  let request: any;
++  let context: ExecutionContext;
++
++  beforeEach(() => {
++    repository = {
++      findById: jest.fn(),
++      findByQuery: jest.fn(),
++      getStaticDataSourceByKind: jest.fn(),
++    };
++    guard = new ValidateQuerySourceGuard(repository, { log: jest.fn() } as any);
++    request = { params: {}, user: { organizationId: 'workspace-a' } };
++    context = { switchToHttp: () => ({ getRequest: () => request }) } as ExecutionContext;
++  });
++
++  it.each(['restapi', 'runjs', 'runpy', 'tooljetdb', 'workflows'])(
++    'resolves %s within the authenticated workspace without treating it as a UUID',
++    async (kind) => {
++      const source = { id: 'actual-source-uuid', kind, organizationId: 'workspace-a' };
++      request.params.dataSourceId = kind;
++      repository.getStaticDataSourceByKind.mockResolvedValue(source);
++      await expect(guard.canActivate(context)).resolves.toBe(true);
++      expect(repository.getStaticDataSourceByKind).toHaveBeenCalledWith('workspace-a', kind);
++      expect(repository.findById).not.toHaveBeenCalled();
++      expect(request.tj_data_source).toBe(source);
++      expect(request.tj_resource_id).toBe(source.id);
++    }
++  );
++
++  it('keeps external data source UUID lookup scoped to the workspace', async () => {
++    const id = '8cdcdb39-8c6a-4386-ae59-bb3842b1b2f3';
++    request.params.dataSourceId = id;
++    repository.findById.mockResolvedValue({ id });
++    await expect(guard.canActivate(context)).resolves.toBe(true);
++    expect(repository.findById).toHaveBeenCalledWith(id, 'workspace-a');
++    expect(repository.getStaticDataSourceByKind).not.toHaveBeenCalled();
++  });
++
++  it('keeps existing query lookup for updates and executions', async () => {
++    request.params.id = 'query-uuid';
++    repository.findByQuery.mockResolvedValue({ id: 'source-uuid' });
++    await expect(guard.canActivate(context)).resolves.toBe(true);
++    expect(repository.findByQuery).toHaveBeenCalledWith('query-uuid', 'workspace-a', undefined);
++    expect(repository.getStaticDataSourceByKind).not.toHaveBeenCalled();
++  });
++
++  it('rejects unauthenticated built-in source requests', async () => {
++    request.params.dataSourceId = 'runjs';
++    delete request.user;
++    await expect(guard.canActivate(context)).rejects.toBeInstanceOf(ForbiddenException);
++    expect(repository.getStaticDataSourceByKind).not.toHaveBeenCalled();
++  });
++
++  it('does not attach a source missing from the current workspace', async () => {
++    request.params.dataSourceId = 'runjs';
++    repository.getStaticDataSourceByKind.mockResolvedValue(null);
++    await expect(guard.canActivate(context)).rejects.toBeInstanceOf(NotFoundException);
++    expect(request.tj_data_source).toBeUndefined();
++  });
++});

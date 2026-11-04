@@ -1,0 +1,47 @@
+# ToolJet plugins 镜像 —— 本地开发变体（跳过依赖的 install 脚本）
+#
+# 与上游 docker/plugins.Dockerfile.dev 的唯一差异：
+#   npm --prefix plugins install  →  额外加 --ignore-scripts
+#
+# 原因：
+#   plugins 的依赖树里有 13 个带 install 脚本的包，其中多个会在安装时从厂商站点
+#   下载大体积二进制：
+#     oracledb          → AWS S3 下载 Oracle Instant Client（实测仅 44KB/s，会卡死构建）
+#     ibm_db            → 下载 IBM DB2 驱动
+#     @sap/hana-client  → 下载 SAP HANA 客户端
+#     ssh2 / lz4 / protobufjs / leveldown 等 → 编译或下载原生模块
+#   而本镜像的运行命令是 `tsc -b --watch`，是**纯 TypeScript 编译**，
+#   完全不需要这些原生二进制。这些二进制只在真正调用对应数据源
+#   （Oracle / DB2 / HANA）时才用得上，本项目的研读目标不涉及，故直接跳过。
+#
+# 影响：
+#   * 构建从「卡在 S3 下载」变成几分钟完成
+#   * oracledb / ibm_db / hana 这三个数据源在本地环境不可用，其余 46 个正常
+#
+# 另一处改动（见文件末尾）：把 /app/plugins/node_modules/.bin 放进 PATH。
+#   上游漏了这一行（client.Dockerfile.dev 对 frontend 就有）。
+#   放在文件末尾而不是中间，是为了让前面 npm install 那一层的缓存仍然命中，
+#   重建镜像只需几秒而不是重新拉一遍 900MB 依赖。
+#
+# 本文件未被 git 跟踪（已写入 .git/info/exclude），上游 tracked 文件保持原样。
+
+FROM node:22.23.4-bookworm
+
+RUN npm i -g npm@10.9.9
+
+# set working directory
+WORKDIR /app
+
+COPY ./package.json ./package.json
+
+# Fix for heap limit allocation issue
+ENV NODE_OPTIONS="--max-old-space-size=4096"
+
+# Build plugins
+COPY ./plugins/package.json ./plugins/package-lock.json ./plugins/
+RUN npm --prefix plugins install --ignore-scripts --no-audit --no-fund
+COPY ./plugins/ ./plugins/
+
+# 把 /app/plugins/node_modules/.bin 放进 PATH
+# 否则容器里直接执行 `tsc -b --watch` 会报 "tsc: not found"
+ENV PATH /app/plugins/node_modules/.bin:$PATH
